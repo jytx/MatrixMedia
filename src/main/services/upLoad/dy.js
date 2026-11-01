@@ -15,7 +15,12 @@ import {
   buildPlatformVideoText,
   normalizeVideoTags,
 } from "../../../shared/videoMetadata.js";
-import { head, matchesHead, replaceAllText } from "./textReadback.js";
+import {
+  head,
+  matchesHead,
+  normalizeForCompare,
+  replaceAllText,
+} from "./textReadback.js";
 
 async function dismissDyGuideModals(page) {
   const closed = await page.evaluate(() => {
@@ -287,6 +292,154 @@ async function clickDyPublish(page, isDraftMode) {
   );
 }
 
+export const DY_EDITOR_SELECTOR = ".zone-container.editor-kit-container";
+
+/** 抖音简介编辑器文本归一：去空白/零宽字符与 #（话题转胶囊后 # 可能消失），用于回读比对 */
+function normalizeDyEditorText(str) {
+  return normalizeForCompare(str).replace(/#/g, "");
+}
+
+async function readDyEditorText(page) {
+  return page
+    .evaluate((sel) => {
+      const el = document.querySelector(sel);
+      return el ? String(el.textContent || "") : "";
+    }, DY_EDITOR_SELECTOR)
+    .catch(() => "");
+}
+
+/**
+ * 清空抖音简介编辑器，双策略：
+ * A) selection API + execCommand("delete")——依赖文档焦点，Windows 后台窗口下
+ *    是静默 no-op（这正是「简介无限叠加」的根因）；
+ * B) 键盘全选 + Backspace——走 CDP 按键事件到焦点元素，不依赖 execCommand 焦点语义。
+ * 返回是否确认清空（回读为空）。
+ */
+async function clearDyEditor(page) {
+  try {
+    await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return;
+      el.focus();
+      const s = window.getSelection && window.getSelection();
+      if (s && s.selectAllChildren) {
+        try {
+          s.selectAllChildren(el);
+        } catch (_) {}
+      }
+      if (document.execCommand) document.execCommand("delete");
+    }, DY_EDITOR_SELECTOR);
+  } catch (_) {}
+  if (!normalizeDyEditorText(await readDyEditorText(page))) return true;
+  const mod = process.platform === "darwin" ? "Meta" : "Control";
+  try {
+    await page.focus(DY_EDITOR_SELECTOR);
+    await page.keyboard.down(mod);
+    await page.keyboard.press("a");
+    await page.keyboard.up(mod);
+    await page.keyboard.press("Backspace");
+  } catch (_) {}
+  return !normalizeDyEditorText(await readDyEditorText(page));
+}
+
+/**
+ * 抖音简介（含 #标签）填写：确认清空 → 键盘输入 → 回读校验，未落地则
+ * execCommand insertText 整段兜底重写，重试 maxAttempts 次仍失败抛错中止发布
+ * （对齐快手 fillKsDescription 策略）：宁可走失败上报/自动重试，
+ * 也不能发出空简介或与旧草稿叠加成双的作品。
+ */
+export async function fillDyDescription(
+  page,
+  description,
+  pressSpaceAfter,
+  { maxAttempts = 3 } = {}
+) {
+  await page.waitForSelector(DY_EDITOR_SELECTOR, {
+    timeout: WAIT_SELECTOR_APPEAR_MS,
+  });
+  const expected = normalizeDyEditorText(description || "");
+  // 前缀锚点：话题胶囊转换会改写中后段文本（正文里的 # 会触发抖音话题搜索组件，
+  // e2e 实证「issue #42」会让回读比原文少 1 字），但开头按序落地。
+  const prefix = expected.slice(0, 12);
+  // 长度窗口：下限容忍话题胶囊对中后段文本的改写；
+  // 上限拦截「旧内容没清掉被追加成双」（叠加时长度近似翻倍）。
+  const landedOk = (landed) => {
+    if (!expected) return true;
+    if (prefix && !landed.includes(prefix)) return false;
+    return (
+      landed.length >= expected.length - 12 &&
+      landed.length <= Math.ceil(expected.length * 1.4) + 8
+    );
+  };
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await page.click(DY_EDITOR_SELECTOR); // 定位光标 + 聚焦
+    } catch (_) {
+      /* click 偶发失败不致命，clearDyEditor 内有 focus 兜底 */
+    }
+    if (!(await clearDyEditor(page))) {
+      console.warn(
+        `[dy] 第 ${attempt} 次清空简介编辑器失败（旧内容仍在），重试`
+      );
+      continue;
+    }
+    if (description) {
+      await page.keyboard.type(description, { delay: 50 });
+    }
+    // 抖音话题只有遇到空格/回车才会把当前 #xxx 转成话题胶囊；
+    // 末尾补一次空格触发，否则最后一个标签不被识别。
+    if (pressSpaceAfter) {
+      await page.keyboard.press("Space");
+    }
+
+    let landed = normalizeDyEditorText(await readDyEditorText(page));
+    if (landedOk(landed)) {
+      if (attempt > 1) console.log(`[dy] 简介已在第 ${attempt} 次尝试写入`);
+      return;
+    }
+    console.warn(
+      `[dy] 第 ${attempt} 次简介未落地（期望 ${expected.length} 字，回读 ${landed.length} 字：「${landed.slice(0, 60)}」），execCommand 兜底重写`
+    );
+
+    // 兜底：全选删除后 insertText 整段写入（对富文本组件比键盘事件可靠）
+    await page.evaluate((payload) => {
+      const el = document.querySelector(payload.sel);
+      if (!el) return;
+      el.focus();
+      if (document.createRange && window.getSelection) {
+        try {
+          const r = document.createRange();
+          r.selectNodeContents(el);
+          const s = window.getSelection();
+          s.removeAllRanges();
+          s.addRange(r);
+        } catch (_) {}
+      }
+      if (document.execCommand) {
+        document.execCommand("delete");
+        document.execCommand("insertText", false, payload.text);
+      }
+    }, { sel: DY_EDITOR_SELECTOR, text: description || "" });
+    if (pressSpaceAfter) {
+      await page.keyboard.press("Space");
+    }
+
+    landed = normalizeDyEditorText(await readDyEditorText(page));
+    if (landedOk(landed)) {
+      console.log(
+        `[dy] 简介已通过 execCommand 兜底写入（第 ${attempt} 次尝试）`
+      );
+      return;
+    }
+  }
+
+  const finalText = normalizeDyEditorText(await readDyEditorText(page));
+  throw new Error(
+    `抖音简介填写失败：尝试 ${maxAttempts} 次后文案仍未正确写入编辑器（编辑器当前 ${finalText.length} 字：「${finalText.slice(0, 60)}」，期望 ${expected.length} 字），为避免发出空简介/内容叠加的作品已中止本次发布`
+  );
+}
+
 export default async function (page, data, window, event) {
   const isDraftMode =
     data.publishMode === "draft" || data.publishToDraft === true;
@@ -346,28 +499,15 @@ export default async function (page, data, window, event) {
       }
     }
 
-    const input2 = await page.$(".zone-container.editor-kit-container");
-    await input2.click(); // 定位光标
-    // 必须清掉旧内容：抖音创作页同分区会恢复上次编辑的简介，
-    // 不清空的话新简介（含 #标签）会追加在旧内容后面 → 内容和标签成双。
-    await input2
-      .evaluate((el) => {
-        el.focus();
-        const sel = window.getSelection();
-        if (sel && sel.selectAllChildren) {
-          sel.selectAllChildren(el);
-          if (document.execCommand) document.execCommand("delete");
-        }
-      })
-      .catch(() => {});
-    if (text.description) {
-      await page.keyboard.type(text.description, { delay: 50 });
-    }
-    // 抖音话题只有遇到空格/回车才会把当前 #xxx 转成话题胶囊；
-    // bq 末尾没有分隔符会导致最后一个标签没被识别，这里补一次空格触发。
-    if (normalizeVideoTags(data.data.tags).length) {
-      await page.keyboard.press("Space");
-    }
+    // 描述（含 #标签）填写：确认清空 + 键盘输入 + 回读校验 + execCommand 兜底。
+    // 必须清掉旧内容：抖音创作页同分区会恢复上次编辑的简介，清空失效时
+    // 新简介会追加在旧内容后面 → 内容和标签成双，多次发布无限累加
+    //（Windows 后台窗口下 execCommand("delete") 静默失效，2026-11-01 用户反馈）。
+    await fillDyDescription(
+      page,
+      text.description,
+      normalizeVideoTags(data.data.tags).length > 0
+    );
   } catch (e) {
     console.error("❌ 输入标题失败", e);
     await replyPublishFailure({

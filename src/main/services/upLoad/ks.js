@@ -273,7 +273,42 @@ async function uploadKsCustomCover(page, coverPath) {
   );
 }
 
+/**
+ * 关闭快手创作页的新手引导弹窗（「1/4 作品信息…下一步」等导览）。
+ * 实测它会压在表单上方，声明下拉打开后会被它抢焦点/遮挡，导致选项等不到。
+ * 策略：点「跳过/我知道了/下一步」类按钮或关闭图标，最多 6 轮。
+ */
+async function dismissKsGuideModals(page) {
+  for (let round = 0; round < 6; round++) {
+    const clicked = await page.evaluate(() => {
+      var norm = function (t) {
+        return String(t || "").replace(/\s+/g, "").trim();
+      };
+      var TEXTS = ["跳过", "我知道了", "知道了", "下一步"];
+      var nodes = document.querySelectorAll(
+        "button, [role='button'], [class*='close' i], [class*='Close']"
+      );
+      for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i];
+        var r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue;
+        var t = norm(el.textContent);
+        var isClose = /close/i.test(el.className || "");
+        if (isClose || TEXTS.indexOf(t) !== -1) {
+          el.click();
+          return t || "close-icon";
+        }
+      }
+      return null;
+    });
+    if (!clicked) return;
+    console.log(`[ks] 已关闭引导弹窗（点击: ${clicked}）`);
+    await page.waitForTimeout(600);
+  }
+}
+
 async function selectKsCreativeStatement(page, data) {
+  await dismissKsGuideModals(page);
   const value = data.data && data.data.creativeStatement;
   console.log("[ks] creativeStatement 值 =", value);
   // 快手目前只支持 AI 生成 / 演绎情节 两个选项；其它值（含「无标注」）无对应选项，跳过即可。
@@ -284,7 +319,7 @@ async function selectKsCreativeStatement(page, data) {
   const label = resolveKsCreativeStatementLabel(value);
   // 当前快手「作者声明」下拉支持的四个文案；未匹配则跳过。
   const SUPPORTED = new Set([
-    "内容为AI生成",
+    "含AI生成内容",
     "演绎情节，仅供娱乐",
     "个人观点，仅供参考",
     "素材来源于网络",
@@ -294,6 +329,12 @@ async function selectKsCreativeStatement(page, data) {
     return;
   }
   console.log("[ks] 准备选择声明:", label);
+  // 平台文案兼容：AI 声明曾用「内容为AI生成」，后改为「含AI生成内容」；
+  // 两个文案都接受，避免平台改文案导致声明选择全线失败。
+  const KS_LABEL_ALIASES = {
+    "含AI生成内容": ["含AI生成内容", "内容为AI生成"],
+  };
+  const candidates = KS_LABEL_ALIASES[label] || [label];
 
   // 1. 通过 label 文本"作者声明 / 作品声明 / 声明"定位下拉触发器；返回它的 id 给后续用 page.click。
   //    ant-design Select 监听的是 mousedown，必须用真实鼠标事件（page.click 自带）才能打开下拉。
@@ -373,7 +414,7 @@ async function selectKsCreativeStatement(page, data) {
   //    其 title 属性 = 文案；隐藏的 [role="option"] 不可点击，要忽略）
   try {
     await page.waitForFunction(
-      (text) => {
+      (texts) => {
         var opts = document.querySelectorAll(
           ".ant-select-dropdown .ant-select-item.ant-select-item-option"
         );
@@ -384,20 +425,40 @@ async function selectKsCreativeStatement(page, data) {
             (o.querySelector(".ant-select-item-option-content") || {})
               .textContent ||
             "";
-          if (String(t).trim() === text) return true;
+          if (texts.indexOf(String(t).trim()) !== -1) return true;
         }
         return false;
       },
       { timeout: 15000 },
-      label
+      candidates
     );
   } catch (e) {
+    // 取证：把页面上所有下拉项的实际文案带出来，便于校准文案表（平台改文案时一眼定位）
+    const titles = await page
+      .evaluate(() => {
+        var out = [];
+        var opts = document.querySelectorAll(
+          ".ant-select-dropdown .ant-select-item-option, .ant-select-item-option"
+        );
+        for (var i = 0; i < opts.length; i++) {
+          var o = opts[i];
+          out.push(
+            o.getAttribute("title") || String(o.textContent || "").trim()
+          );
+        }
+        return out;
+      })
+      .catch(() => []);
     // 同上：下拉项没出现是硬失败，交给调用方决定是否中止（P1-5）
-    throw new Error(`快手创作声明下拉项未出现: ${e?.message || e}`);
+    throw new Error(
+      `快手创作声明下拉项未出现（期望 ${JSON.stringify(
+        candidates
+      )}，实际下拉项 ${JSON.stringify(titles)}）: ${e?.message || e}`
+    );
   }
 
   // 3. 点选目标选项：点 .ant-select-item-option 本身（ant-design 在它上面绑定 mousedown）
-  const pickResult = await page.evaluate((text) => {
+  const pickResult = await page.evaluate((texts) => {
     var opts = document.querySelectorAll(
       ".ant-select-dropdown .ant-select-item.ant-select-item-option"
     );
@@ -412,7 +473,7 @@ async function selectKsCreativeStatement(page, data) {
         (o.querySelector(".ant-select-item-option-content") || {})
           .textContent ||
         "";
-      if (String(t).trim() !== text) continue;
+      if (texts.indexOf(String(t).trim()) === -1) continue;
       var rect = o.getBoundingClientRect();
       var opts2 = {
         bubbles: true,
@@ -430,21 +491,25 @@ async function selectKsCreativeStatement(page, data) {
       if (inner) {
         inner.dispatchEvent(new MouseEvent("click", opts2));
       }
-      return { ok: true, titles: titles };
+      return { ok: true, titles: titles, matched: String(t).trim() };
     }
     return { ok: false, titles: titles };
-  }, label);
+  }, candidates);
 
   if (!pickResult || !pickResult.ok) {
     console.warn(
-      `未找到快手声明选项: ${label}；下拉里实际 title 列表 = ${JSON.stringify(
+      `未找到快手声明选项: ${JSON.stringify(candidates)}；下拉里实际 title 列表 = ${JSON.stringify(
         pickResult && pickResult.titles
       )}`
     );
     return;
   }
   await page.waitForTimeout(300);
-  console.log("[ks] 已选择声明:", label);
+  console.log(
+    "[ks] 已选择声明:",
+    pickResult.matched || label,
+    label !== (pickResult.matched || label) ? `（期望文案: ${label}）` : ""
+  );
 }
 
 export default async function (page, data, window, event) {

@@ -25,7 +25,13 @@ const CASES = {
     creativeStatement: "ai_generated",
   },
   xhs: { name: "小红书", tags: "原创音乐,AI音乐" },
-  ks: { name: "快手", tags: "原创音乐" },
+  ks: {
+    name: "快手",
+    tags: "原创音乐",
+    // 快手声明选择失败会中止发布（P1-5），e2e 带上 ai_generated 验证
+    // 「含AI生成内容」现行文案匹配（曾用「内容为AI生成」）
+    creativeStatement: "ai_generated",
+  },
   bjh: { name: "百家号", tags: "原创音乐" },
   tt: { name: "头条", tags: "原创音乐" },
 };
